@@ -1,5 +1,7 @@
 import logging
 import re
+import requests
+import base64
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -7,7 +9,7 @@ from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from psychrometric_calculator import calculate_humidity
 from config import BOT_TOKEN, OPENAI_API_KEY
-import openai
+from openai import OpenAI
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -18,7 +20,7 @@ storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
 # Настройка OpenAI
-openai.api_key = OPENAI_API_KEY
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # Состояния для FSM
@@ -286,6 +288,8 @@ async def process_photo(message: types.Message, state: FSMContext):
 async def analyze_photo_with_openai(file_path: str) -> dict:
     """Анализ фотографии через OpenAI Vision API"""
     try:
+        logging.info(f"🔍 Начинаю анализ фото: {file_path}")
+        
         # Промпт для анализа фото психрометра
         photo_prompt = """
         Проанализируй фотографию психрометра ВИТ-1 и определи показания термометров.
@@ -300,16 +304,16 @@ async def analyze_photo_with_openai(file_path: str) -> dict:
         ОШИБКА: Не удалось определить показания термометров
         """
 
-        # Скачиваем файл фото
-        import requests
-        import base64
-        
         # Получаем URL файла
         file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        logging.info(f"📥 Скачиваю фото с URL: {file_url}")
         
         # Скачиваем изображение
         response = requests.get(file_url)
+        logging.info(f"📊 Статус скачивания: {response.status_code}")
+        
         if response.status_code != 200:
+            logging.error(f"❌ Ошибка скачивания фото: {response.status_code}")
             return {
                 "success": False,
                 "t_dry": None,
@@ -319,10 +323,12 @@ async def analyze_photo_with_openai(file_path: str) -> dict:
         
         # Кодируем изображение в base64
         image_base64 = base64.b64encode(response.content).decode('utf-8')
+        logging.info(f"🔄 Изображение закодировано в base64, размер: {len(image_base64)} символов")
         
-        # Отправляем запрос в OpenAI Vision API
-        openai_response = await openai.ChatCompletion.acreate(
-            model="gpt-5",
+        # Отправляем запрос в OpenAI Vision API с новым синтаксисом
+        logging.info("🧠 Отправляю запрос в OpenAI Vision API...")
+        openai_response = client.chat.completions.create(
+            model="gpt-4.1",
             messages=[
                 {
                     "role": "user",
@@ -340,31 +346,40 @@ async def analyze_photo_with_openai(file_path: str) -> dict:
                     ]
                 }
             ],
-            max_completion_tokens=100,
-            temperature=0.1
+            max_tokens=100
         )
         
         # Парсим ответ от OpenAI
         ai_response = openai_response.choices[0].message.content.strip()
+        logging.info(f"🤖 Ответ от OpenAI: {ai_response}")
         
         # Извлекаем данные из ответа
         lines = ai_response.split('\n')
         t_dry = None
         t_wet = None
         
+        logging.info(f"📝 Парсинг ответа, строк: {len(lines)}")
+        
         for line in lines:
             line = line.strip()
+            logging.info(f"🔍 Обрабатываю строку: '{line}'")
+            
             if line.startswith('СУХОЙ:'):
                 try:
                     t_dry = float(line.split(':')[1].strip())
-                except (ValueError, IndexError):
+                    logging.info(f"✅ Найден сухой термометр: {t_dry}°C")
+                except (ValueError, IndexError) as e:
+                    logging.error(f"❌ Ошибка парсинга сухого термометра: {e}")
                     pass
             elif line.startswith('ВЛАЖНЫЙ:'):
                 try:
                     t_wet = float(line.split(':')[1].strip())
-                except (ValueError, IndexError):
+                    logging.info(f"✅ Найден влажный термометр: {t_wet}°C")
+                except (ValueError, IndexError) as e:
+                    logging.error(f"❌ Ошибка парсинга влажного термометра: {e}")
                     pass
             elif line.startswith('ОШИБКА:'):
+                logging.error("❌ OpenAI сообщил об ошибке распознавания")
                 return {
                     "success": False,
                     "t_dry": None,
@@ -373,7 +388,10 @@ async def analyze_photo_with_openai(file_path: str) -> dict:
                 }
         
         # Проверяем, что получили оба значения
+        logging.info(f"📊 Результат парсинга - Сухой: {t_dry}, Влажный: {t_wet}")
+        
         if t_dry is None or t_wet is None:
+            logging.error(f"❌ Не удалось извлечь данные из ответа: {ai_response}")
             return {
                 "success": False,
                 "t_dry": None,
@@ -383,6 +401,7 @@ async def analyze_photo_with_openai(file_path: str) -> dict:
         
         # Проверяем корректность значений
         if t_dry < t_wet:
+            logging.error(f"❌ Логическая ошибка: сухой ({t_dry}) < влажный ({t_wet})")
             return {
                 "success": False,
                 "t_dry": None,
@@ -390,6 +409,7 @@ async def analyze_photo_with_openai(file_path: str) -> dict:
                 "error": "Показание влажного термометра не может быть больше показания сухого термометра"
             }
         
+        logging.info(f"✅ Успешный анализ: Сухой {t_dry}°C, Влажный {t_wet}°C")
         return {
             "success": True,
             "t_dry": t_dry,
@@ -398,6 +418,7 @@ async def analyze_photo_with_openai(file_path: str) -> dict:
         }
 
     except Exception as e:
+        logging.error(f"💥 Критическая ошибка анализа фото: {str(e)}")
         return {
             "success": False,
             "t_dry": None,
